@@ -2,9 +2,9 @@
 <html>
 <head>
 <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Multi-Model Weather</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
-<meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:system-ui,sans-serif;background:#0f1117;color:#e8eaf0;padding:1.5rem;max-width:1200px;margin:0 auto}
@@ -65,8 +65,6 @@ td.day-cell{text-align:left}
 .hrrr-stat-label{font-size:.65rem;color:#4b5563;text-transform:uppercase;letter-spacing:.5px}
 .hrrr-stat-value{font-size:1.1rem;font-weight:600;color:#e8eaf0}
 .hrrr-chart-tabs{display:flex;gap:6px;margin-bottom:.8rem}
-
-/* Mobile */
 @media(max-width:700px){
   body{padding:.8rem}
   h1{font-size:1.1rem}
@@ -87,14 +85,10 @@ td.day-cell{text-align:left}
   .hrrr-stat-value{font-size:.95rem}
   .hrrr-badge{display:none}
 }
-
-/* Small phones */
 @media(max-width:400px){
   .cards{grid-template-columns:repeat(2,1fr)}
   .big-temp{font-size:1.2rem}
 }
-
-/* Wide desktop */
 @media(min-width:1000px){
   .chart-wrap{height:300px}
   .cards{grid-template-columns:repeat(6,1fr)}
@@ -215,6 +209,7 @@ const CITY_DB=[
 function setStatus(m){document.getElementById('status').textContent=m;}
 function setProgress(m){document.getElementById('progress').textContent=m;}
 
+/* ── Collapsible API keys ── */
 function toggleKeys(){
   const grid=document.getElementById('keyGrid');
   const arrow=document.getElementById('keyArrow');
@@ -358,11 +353,344 @@ async function fetchGFS(lat,lon){
 }
 
 async function fetchHRRR(lat,lon){
-  // /v1/gfs seamlessly combines GFS+HRRR; with forecast_days=2 we get primarily HRRR data for US locations
   const r=await fetch(`https://api.open-meteo.com/v1/gfs?latitude=${lat}&longitude=${lon}&hourly=temperature_2m,precipitation_probability,precipitation,wind_speed_10m,relative_humidity_2m&current=temperature_2m,weather_code,wind_speed_10m,relative_humidity_2m&temperature_unit=fahrenheit&wind_speed_unit=mph&forecast_days=2&timezone=auto&minutely_15=temperature_2m`);
   const d=await r.json();
   if(d.error)return{error:d.reason||d.error};
   const wmo={0:'Clear',1:'Mainly clear',2:'Partly cloudy',3:'Overcast',45:'Foggy',51:'Light drizzle',61:'Light rain',71:'Light snow',80:'Showers',95:'Thunderstorm'};
   const nowIdx=(d.hourly?.time||[]).findIndex(t=>t>=new Date().toISOString().slice(0,13));
   const idx=nowIdx>=0?nowIdx:0;
-  const curTemp=d.current?.temperature_2m??d.hourly?.temperature_2m?
+  const curTemp=d.current?.temperature_2m??d.hourly?.temperature_2m?.[idx];
+  const curCode=d.current?.weather_code??0;
+  const curWind=d.current?.wind_speed_10m;
+  const curHumidity=d.current?.relative_humidity_2m;
+  const dayMap={};
+  (d.hourly?.time||[]).forEach((t,i)=>{
+    const date=t.slice(0,10);
+    const temp=d.hourly.temperature_2m[i];
+    if(temp===null||temp===undefined)return;
+    if(!dayMap[date])dayMap[date]={date,hi:-999,lo:999};
+    if(temp>dayMap[date].hi)dayMap[date].hi=temp;
+    if(temp<dayMap[date].lo)dayMap[date].lo=temp;
+  });
+  return{
+    current:{temp:curTemp,condition:wmo[curCode]||'HRRR Model',wind:curWind,humidity:curHumidity},
+    daily:Object.values(dayMap).slice(0,2),
+    hourly:(d.hourly?.time||[]).slice(idx,idx+48).map((t,i)=>({
+      t,
+      temp:d.hourly.temperature_2m[idx+i],
+      precip:(d.hourly.precipitation_probability?.[idx+i]||0)/100,
+      precipMm:d.hourly.precipitation?.[idx+i]||0,
+      wind:d.hourly.wind_speed_10m?.[idx+i]||0,
+      humidity:d.hourly.relative_humidity_2m?.[idx+i]||0,
+    })),
+    fetchedAt:new Date()
+  };
+}
+
+async function fetchNWS(lat,lon){
+  const p=await fetch(`https://api.weather.gov/points/${lat.toFixed(4)},${lon.toFixed(4)}`);
+  const pj=await p.json();
+  const[fr,hr]=await Promise.all([fetch(pj.properties.forecast),fetch(pj.properties.forecastHourly)]);
+  const[fd,hd]=await Promise.all([fr.json(),hr.json()]);
+  const periods=fd.properties.periods;
+  const hourly=hd.properties.periods.slice(0,168);
+  const daily=[];
+  for(let i=0;i<periods.length-1;i+=2)daily.push({date:periods[i].startTime.slice(0,10),hi:periods[i].temperature,lo:periods[i+1]?.temperature||periods[i].temperature});
+  return{
+    current:{temp:hourly[0].temperature,condition:hourly[0].shortForecast},
+    daily,
+    hourly:hourly.map(h=>({t:h.startTime,temp:h.temperature,precip:(h.probabilityOfPrecipitation?.value||0)/100}))
+  };
+}
+
+async function fetchVC(lat,lon,key){
+  if(!key)return{error:'No API key'};
+  const r=await fetch(`https://weather.visualcrossing.com/VisualCrossingWebServices/rest/services/timeline/${lat},${lon}?unitGroup=us&key=${key}&contentType=json&include=hours,days,current`);
+  if(!r.ok)return{error:'Invalid key or limit reached'};
+  const d=await r.json();
+  const cur=d.currentConditions;
+  const allH=d.days.flatMap(day=>day.hours.map(h=>({t:`${day.datetime}T${h.datetime}`,temp:h.temp,precip:(h.precipprob||0)/100})));
+  return{current:{temp:cur.temp,condition:cur.conditions},daily:d.days.map(x=>({date:x.datetime,hi:x.tempmax,lo:x.tempmin})),hourly:allH.slice(0,168)};
+}
+
+async function fetchTIO(lat,lon,key){
+  if(!key)return{error:'No API key'};
+  const r=await fetch(`https://api.tomorrow.io/v4/weather/forecast?location=${lat},${lon}&apikey=${key}&units=imperial`);
+  if(!r.ok)return{error:'Invalid key or limit reached'};
+  const d=await r.json();
+  const conds={1000:'Clear',1100:'Mostly clear',1101:'Partly cloudy',1102:'Mostly cloudy',1001:'Cloudy',4000:'Drizzle',4001:'Rain',4200:'Light rain',5000:'Snow',8000:'Thunderstorm'};
+  return{
+    current:{temp:d.timelines.hourly[0].values.temperature,condition:conds[d.timelines.hourly[0].values.weatherCode]||'N/A'},
+    daily:d.timelines.daily.map(x=>({date:x.time.slice(0,10),hi:x.values.temperatureMax,lo:x.values.temperatureMin})),
+    hourly:d.timelines.hourly.slice(0,168).map(h=>({t:h.time,temp:h.values.temperature,precip:(h.values.precipitationProbability||0)/100}))
+  };
+}
+
+async function fetchWindy(lat,lon,key){
+  if(!key)return{error:'No API key'};
+  const body=JSON.stringify({lat,lon,model:'gfs',parameters:['temp'],levels:['surface'],key});
+  const headers={'Content-Type':'application/json'};
+  const proxies=[
+    'https://windy-proxy.dynastar5.workers.dev',
+    'http://localhost:3131/windy',
+  ];
+  let d=null;
+  for(const url of proxies){
+    try{
+      const r=await fetch(url,{method:'POST',headers,body});
+      if(r.ok){d=await r.json();break;}
+    }catch(e){console.warn('Windy proxy failed:',url,e.message);}
+  }
+  if(!d)return{error:'Windy unavailable (CORS — check proxy)'};
+  const temps=d['temp-surface'],times=d.ts;
+  if(!temps||!times)return{error:'Unexpected Windy response'};
+  const toF=k=>parseFloat(((k-273.15)*9/5+32).toFixed(1));
+  // Windy returns data at 3-hour intervals — interpolate to hourly
+  const raw=times.map((t,i)=>({ts:t,temp:toF(temps[i])}));
+  const hourly=[];
+  for(let i=0;i<raw.length-1;i++){
+    const t0=raw[i].ts, t1=raw[i+1].ts;
+    const temp0=raw[i].temp, temp1=raw[i+1].temp;
+    const steps=Math.round((t1-t0)/3600000);
+    for(let s=0;s<steps;s++){
+      const frac=s/steps;
+      hourly.push({
+        t:new Date(t0+s*3600000).toISOString(),
+        temp:Math.round((temp0+(temp1-temp0)*frac)*10)/10,
+        precip:0
+      });
+    }
+  }
+  // Add last point
+  hourly.push({t:new Date(raw[raw.length-1].ts).toISOString(),temp:raw[raw.length-1].temp,precip:0});
+  // Trim to start from current hour
+  const nowISO=new Date().toISOString().slice(0,13);
+  const startIdx=hourly.findIndex(h=>h.t.slice(0,13)>=nowISO);
+  const trimmed=startIdx>0?hourly.slice(startIdx):hourly;
+  const dayMap={};
+  trimmed.forEach(h=>{
+    const date=h.t.slice(0,10);
+    if(!dayMap[date])dayMap[date]={date,hi:-999,lo:999};
+    if(h.temp>dayMap[date].hi)dayMap[date].hi=h.temp;
+    if(h.temp<dayMap[date].lo)dayMap[date].lo=h.temp;
+  });
+  return{current:{temp:trimmed[0]?.temp??toF(temps[0]),condition:'GFS Model'},daily:Object.values(dayMap).slice(0,7),hourly:trimmed};
+}
+
+/* ── HRRR Section ── */
+function renderHRRR(){
+  const box=document.getElementById('hrrrBox');
+  if(!hrrrData||hrrrData.error){
+    if(hrrrData?.error){
+      box.style.display='block';
+      document.getElementById('hrrrStats').innerHTML=`<span class="err-msg">${hrrrData.error}</span>`;
+      document.getElementById('hrrrMeta').textContent='';
+    }else{
+      box.style.display='none';
+    }
+    return;
+  }
+  box.style.display='block';
+  const fetchedAt=hrrrData.fetchedAt?hrrrData.fetchedAt.toLocaleTimeString():'—';
+  document.getElementById('hrrrMeta').textContent='Last refresh: '+fetchedAt;
+  const cur=hrrrData.current;
+  const d0=hrrrData.daily?.[0];
+  const hi=d0?Math.round(d0.hi)+'°F':'—';
+  const lo=d0?Math.round(d0.lo)+'°F':'—';
+  document.getElementById('hrrrStats').innerHTML=`
+    <div class="hrrr-stat"><span class="hrrr-stat-label">Now</span><span class="hrrr-stat-value" style="color:#fb923c">${cur.temp!==undefined?Math.round(cur.temp)+'°F':'—'}</span></div>
+    <div class="hrrr-stat"><span class="hrrr-stat-label">Condition</span><span class="hrrr-stat-value">${cur.condition||'—'}</span></div>
+    <div class="hrrr-stat"><span class="hrrr-stat-label">High</span><span class="hrrr-stat-value hi">${hi}</span></div>
+    <div class="hrrr-stat"><span class="hrrr-stat-label">Low</span><span class="hrrr-stat-value lo">${lo}</span></div>
+    <div class="hrrr-stat"><span class="hrrr-stat-label">Wind</span><span class="hrrr-stat-value">${cur.wind!==undefined?Math.round(cur.wind)+' mph':'—'}</span></div>
+    <div class="hrrr-stat"><span class="hrrr-stat-label">Humidity</span><span class="hrrr-stat-value">${cur.humidity!==undefined?Math.round(cur.humidity)+'%':'—'}</span></div>
+  `;
+  renderHrrrChart();
+}
+
+function setHrrrChartType(t,el){
+  hrrrChartType=t;
+  document.querySelectorAll('#hrrrTypeTabs .tab').forEach(b=>b.classList.remove('on'));
+  el.classList.add('on');
+  renderHrrrChart();
+}
+
+function renderHrrrChart(){
+  if(!hrrrData||hrrrData.error||!hrrrData.hourly?.length)return;
+  const pts=hrrrData.hourly;
+  const labels=pts.map(h=>{
+    const dt=new Date(h.t);
+    return dt.toLocaleTimeString('en-US',{hour:'numeric',hour12:true,weekday:'short'});
+  });
+  let datasets=[];
+  if(hrrrChartType==='temp'){
+    datasets=[{
+      label:'Temperature',data:pts.map(p=>Math.round(p.temp*10)/10),
+      borderColor:HRRR_COLOR,backgroundColor:HRRR_COLOR+'33',
+      borderWidth:2,pointRadius:1,tension:0.3,fill:true,yAxisID:'y'
+    },{
+      label:'Wind (mph)',data:pts.map(p=>Math.round(p.wind)),
+      borderColor:'#6b7280',backgroundColor:'transparent',
+      borderWidth:1,pointRadius:0,tension:0.3,borderDash:[4,3],yAxisID:'y1'
+    }];
+  }else{
+    datasets=[{
+      label:'Precip %',data:pts.map(p=>Math.round(p.precip*100)),
+      borderColor:HRRR_COLOR,backgroundColor:HRRR_COLOR+'33',
+      borderWidth:2,pointRadius:1,tension:0.3,fill:true,yAxisID:'y'
+    },{
+      label:'Precip (mm)',data:pts.map(p=>Math.round(p.precipMm*10)/10),
+      type:'bar',backgroundColor:'#38bdf844',borderColor:'#38bdf8',
+      borderWidth:1,yAxisID:'y1'
+    }];
+  }
+  const ctx=document.getElementById('hrrrChart');
+  if(hrrrChartInst)hrrrChartInst.destroy();
+  const yLabel=hrrrChartType==='temp'?'°F':'%';
+  const y1Label=hrrrChartType==='temp'?'mph':'mm';
+  hrrrChartInst=new Chart(ctx,{type:'line',data:{labels,datasets},options:{
+    responsive:true,maintainAspectRatio:false,
+    plugins:{legend:{display:true,labels:{color:'#6b7280',font:{size:11},boxWidth:12,padding:12}},
+      tooltip:{mode:'index',intersect:false}},
+    scales:{
+      x:{ticks:{color:'#4b5563',font:{size:10},maxTicksLimit:12,maxRotation:0},grid:{color:'#1e2133'}},
+      y:{position:'left',ticks:{color:HRRR_COLOR,font:{size:11},callback:v=>v+yLabel},grid:{color:'#1e2133'}},
+      y1:{position:'right',ticks:{color:'#6b7280',font:{size:11},callback:v=>v+y1Label},grid:{drawOnChartArea:false}}
+    },
+    interaction:{mode:'index',intersect:false}
+  }});
+}
+
+/* ── Main fetch orchestrator ── */
+async function fetchAll(){
+  const city=document.getElementById('cityIn').value.trim();
+  if(!city)return;
+  const btn=document.getElementById('fetchBtn');
+  btn.disabled=true;btn.textContent='Loading…';
+  allData={};hrrrData=null;initCards();
+  document.getElementById('hrrrBox').style.display='none';
+  setStatus('Geocoding…');
+  const vcKey=document.getElementById('vcKey').value.trim();
+  const tioKey=document.getElementById('tioKey').value.trim();
+  const windyKey=document.getElementById('windyKey').value.trim();
+  let coords;
+  try{
+    coords=await geocode(city);
+  }catch(e){
+    setStatus('City not found: '+e.message);
+    btn.disabled=false;btn.textContent='Get Forecast';
+    return;
+  }
+  const{lat,lon,name}=coords;
+  updateMap(lat,lon,name);
+  setStatus('Fetching from all sources…');
+  const total=7;
+  let loaded=0;
+  const tick=()=>{loaded++;setProgress(loaded+'/'+total+' sources loaded');};
+  const run=(id,fn)=>fn.then(d=>{
+    allData[id]=d;updateCard(id,d);renderChart();renderTable();tick();
+  }).catch(e=>{
+    allData[id]={error:e.message};updateCard(id,allData[id]);tick();
+  });
+  const runHRRR=fetchHRRR(lat,lon).then(d=>{
+    hrrrData=d;renderHRRR();tick();
+  }).catch(e=>{
+    hrrrData={error:e.message};renderHRRR();tick();
+  });
+  await Promise.allSettled([
+    run('om',fetchOM(lat,lon)),
+    run('gfs',fetchGFS(lat,lon)),
+    run('nws',fetchNWS(lat,lon)),
+    run('vc',fetchVC(lat,lon,vcKey)),
+    run('tio',fetchTIO(lat,lon,tioKey)),
+    run('windy',fetchWindy(lat,lon,windyKey)),
+    runHRRR,
+  ]);
+  setStatus('Updated '+new Date().toLocaleTimeString()+' · '+name);
+  setProgress('');
+  btn.disabled=false;btn.textContent='Get Forecast';
+}
+
+/* ── Main Chart ── */
+function setChartType(t,el){chartType=t;document.querySelectorAll('#typeTabs .tab').forEach(b=>b.classList.remove('on'));el.classList.add('on');renderChart();}
+function setHorizon(h,el){horizon=h;document.querySelectorAll('#horizonTabs .tab').forEach(b=>b.classList.remove('on'));el.classList.add('on');renderChart();}
+
+function renderChart(){
+  const datasets=[];
+  const activeSources=SOURCES.filter(s=>enabled.has(s.id)&&allData[s.id]&&!allData[s.id].error);
+  activeSources.forEach(s=>{
+    const d=allData[s.id];
+    const pts=(d.hourly||[]).slice(0,horizon);if(!pts.length)return;
+    datasets.push({label:s.label,data:pts.map(p=>chartType==='temp'?Math.round(p.temp*10)/10:Math.round((p.precip||0)*100)),borderColor:s.color,backgroundColor:s.color+'33',borderWidth:2,pointRadius:pts.length>48?0:2,tension:0.3,fill:chartType==='precip'});
+  });
+  // Average line for temperature
+  if(chartType==='temp'&&activeSources.length>=2){
+    const maxLen=Math.min(horizon,...activeSources.map(s=>(allData[s.id].hourly||[]).length));
+    const avgData=[];
+    for(let i=0;i<maxLen;i++){
+      let sum=0,count=0;
+      activeSources.forEach(s=>{
+        const h=allData[s.id].hourly;
+        if(h&&h[i]&&h[i].temp!==undefined&&h[i].temp!==null){
+          sum+=h[i].temp;count++;
+        }
+      });
+      avgData.push(count?Math.round(sum/count*10)/10:null);
+    }
+    datasets.push({
+      label:'Average',data:avgData,
+      borderColor:'#ffffff',backgroundColor:'transparent',
+      borderWidth:3,pointRadius:0,tension:0.3,
+      borderDash:[6,3],fill:false
+    });
+  }
+  const first=activeSources[0];
+  const labels=first?(allData[first.id].hourly||[]).slice(0,horizon).map(h=>{const dt=new Date(h.t);return horizon>48?dt.toLocaleDateString('en-US',{month:'short',day:'numeric'}):dt.toLocaleTimeString('en-US',{hour:'numeric',hour12:true});}):[];
+  const ctx=document.getElementById('mainChart');
+  if(chartInst)chartInst.destroy();
+  chartInst=new Chart(ctx,{type:'line',data:{labels,datasets},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{mode:'index',intersect:false,callbacks:{label:c=>`${c.dataset.label}: ${c.parsed.y}${chartType==='temp'?'°F':'%'}`}}},scales:{x:{ticks:{color:'#4b5563',font:{size:11},maxTicksLimit:12},grid:{color:'#1e2133'}},y:{ticks:{color:'#4b5563',font:{size:11},callback:v=>v+(chartType==='temp'?'°':'%')},grid:{color:'#1e2133'}}},interaction:{mode:'index',intersect:false}}});
+}
+
+/* ── Table ── */
+function renderTable(){
+  const srcs=SOURCES.filter(s=>enabled.has(s.id)&&allData[s.id]&&!allData[s.id].error&&allData[s.id].daily&&allData[s.id].daily.length);
+  if(!srcs.length){document.getElementById('tableBox').style.display='none';return;}
+  const dateSet=new Set();srcs.forEach(s=>(allData[s.id].daily||[]).forEach(d=>dateSet.add(d.date)));
+  const dates=[...dateSet].sort().slice(0,7);
+  let html=`<table><thead><tr><th class="day-col">Day</th>`;
+  srcs.forEach(s=>html+=`<th><span class="pip" style="background:${s.color};display:inline-block;margin-right:4px;vertical-align:middle"></span><span style="color:${s.color}">${s.label}</span><br><span style="color:#374151;font-size:.65rem">Hi / Lo</span></th>`);
+  html+=`<th><span style="color:#fff">Avg</span><br><span style="color:#374151;font-size:.65rem">Hi / Lo</span></th>`;
+  html+=`</tr></thead><tbody>`;
+  dates.forEach(date=>{
+    const dt=new Date(date+'T12:00:00');
+    html+=`<tr><td class="day-cell"><strong>${dt.toLocaleDateString('en-US',{weekday:'short'})}</strong><br><span style="font-size:.7rem;color:#4b5563">${dt.toLocaleDateString('en-US',{month:'short',day:'numeric'})}</span></td>`;
+    let hiSum=0,loSum=0,count=0;
+    srcs.forEach(s=>{const d=(allData[s.id].daily||[]).find(x=>x.date===date);
+      if(d){
+        const hi=Math.round(d.hi??d.tempMax??0);
+        const lo=Math.round(d.lo??d.tempMin??0);
+        hiSum+=hi;loSum+=lo;count++;
+        html+=`<td><span class="hi">${hi}°</span> <span style="color:#374151">/</span> <span class="lo">${lo}°</span></td>`;
+      }else{
+        html+=`<td style="color:#2d3148">—</td>`;
+      }
+    });
+    if(count){
+      html+=`<td style="font-weight:600"><span class="hi">${Math.round(hiSum/count)}°</span> <span style="color:#374151">/</span> <span class="lo">${Math.round(loSum/count)}°</span></td>`;
+    }else{
+      html+=`<td style="color:#2d3148">—</td>`;
+    }
+    html+=`</tr>`;
+  });
+  html+=`</tbody></table>`;
+  document.getElementById('tableWrap').innerHTML=html;document.getElementById('tableBox').style.display='block';
+}
+
+/* ── Init ── */
+initToggles();
+initCards();
+loadPrefs();
+document.getElementById('cityIn').addEventListener('keydown',e=>{if(e.key==='Enter')fetchAll();});
+</script>
+</body>
+</html>
